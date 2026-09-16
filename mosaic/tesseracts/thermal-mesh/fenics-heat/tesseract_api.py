@@ -12,6 +12,7 @@ CRITICAL import order: dolfin_adjoint must immediately follow dolfin so that
 it can monkey-patch solve/assemble and record operations on the adjoint tape.
 """
 
+import hashlib
 import os
 import tempfile
 from typing import Any
@@ -20,6 +21,25 @@ import meshio
 import numpy as np
 from dolfin import *  # noqa: F403
 from dolfin_adjoint import *  # noqa: F403
+
+# Legacy dolfin-adjoint (e.g. dolfin-adjoint==2019.1.0 from conda-forge, as
+# pinned in tesseract_environment.yaml) does not propagate the forward
+# solve's `solver_parameters` to the adjoint linear solve, which then
+# defaults to UMFPACK and runs out of memory well before mumps would (see
+# pasteurlabs/mosaic#180). Force it to mumps too. Newer dolfin-adjoint
+# checkouts fixed this upstream (SolveVarFormBlock now forwards
+# `linear_solver` into the adjoint solve automatically) and no longer expose
+# this compat shim, so skip the patch if it's absent.
+try:
+    import fenics_adjoint.types.compat as _fa_compat
+
+    def _adjoint_linalg_solve_mumps(*args: Any, **kwargs: Any) -> Any:
+        return _fa_compat.backend.solve(*args, "mumps")
+
+    _fa_compat.linalg_solve = _adjoint_linalg_solve_mumps
+except ImportError:
+    pass
+
 from mosaic_shared.problems.thermal_mesh import (
     InputSchema as _CanonicalInputSchema,
 )
@@ -159,10 +179,54 @@ def _mark_neumann_facets(mesh: Mesh, neumann_mask_vals: np.ndarray) -> MeshFunct
 # ---------------------------------------------------------------------------
 # Core solver
 # ---------------------------------------------------------------------------
+#
+# `_SETUP_CACHE` holds a persistent, replayable pair of `ReducedFunctional`s
+# — thermal compliance (`Chat`) and identification error (`Ihat`), each with
+# controls ``[rho, source]`` — per (mesh, BC, material, target_temperature)
+# combination, i.e. everything the problem depends on *except* rho/source.
+# Building it does ONE real solve. Every later evaluation at a different
+# rho/source — the entire point of a topology-optimisation or source-
+# identification run, which calls `apply` thousands of times against the
+# same mesh — calls `Chat([new_rho, new_source])` instead: dolfin-adjoint
+# updates both controls' checkpoints and replays every already-recorded
+# Block's `recompute()` in place (see `pyadjoint.ReducedFunctional.__call__`
+# / `Tape.reset_blocks`). This reuses the compiled UFL forms and re-solves
+# the *linear system* but skips reconstructing Constants/Measures/
+# DirichletBCs/forms from Python and re-hitting FFC's JIT-compile cache
+# lookup on every call. `Chat` and `Ihat` share one tape built from one
+# solve, so replaying `Chat` also refreshes every block `Ihat` needs
+# (`Tape.reset_blocks`/`get_blocks` operate on the whole tape, not per
+# functional) — one replay serves both objectives. So rho/source are plain
+# arguments here, never part of a cache key — the cached object is a pair of
+# functionals that can be replayed at any (rho, source), not a solve at one
+# point.
+#
+# Each `ReducedFunctional` carries *both* controls, so `.derivative()`
+# returns `[d/drho, d/dsource]` from a single adjoint sweep — the adjoint
+# method's cost is ~independent of the number of controls, so this is one
+# backward pass instead of two.
+#
+# `vector_jacobian_product` is self-contained: it replays
+# `Chat([rho, source])` at the point it was handed and then takes the
+# adjoint(s) it needs (dolfin-adjoint's derivative is defined "around the
+# last supplied value of the control" — see
+# `ReducedFunctional.derivative`). It deliberately does NOT reuse a forward
+# solution cached by a preceding `apply` call, even though tesseract-jax
+# always invokes the two back-to-back at the same point: every other
+# differentiable solver in the suite re-evaluates the forward pass inside
+# its own VJP endpoint (jax-fem calls `jax.vjp` fresh each time, and
+# tesseract-core's shared `jax_recipes` residual cache is disabled
+# everywhere), so reusing state across the two endpoints would make this
+# solver's measured VJP cost incomparable with the rest of the benchmark.
+#
+# The source field is always an explicit tape-tracked control (even when
+# every value is zero, which leaves the solution unchanged) so a gradient
+# w.r.t. source is always well-defined from the one shared solve.
+
+_SETUP_CACHE: dict[str, dict[str, Any]] = {}
 
 
-def _solve_heat(
-    rho_values: np.ndarray,
+def _setup_cache_key(
     pts: np.ndarray,
     cells: np.ndarray,
     dirichlet_mask_vals: np.ndarray,
@@ -171,14 +235,41 @@ def _solve_heat(
     neumann_values_vals: np.ndarray,
     k_max: float,
     p_exp: float,
-    compute_gradient: bool = False,
-    source_values: np.ndarray | None = None,
-    compute_rho_id_gradient: bool = False,
-    target_temperature: np.ndarray | None = None,
-):
-    """Solve the 3-D steady-state heat conduction topology optimisation problem.
+    target_temperature: np.ndarray,
+) -> str:
+    """Hash everything the Chat/Ihat graphs depend on — i.e. everything
+    except rho/source, which `Chat([rho, source])` replays the graph at."""
+    h = hashlib.sha256()
+    for arr in (
+        pts,
+        cells,
+        dirichlet_mask_vals,
+        dirichlet_values_vals,
+        neumann_mask_vals,
+        neumann_values_vals,
+        target_temperature,
+    ):
+        h.update(np.ascontiguousarray(arr).tobytes())
+    h.update(np.array([k_max, p_exp], dtype=np.float64).tobytes())
+    return h.hexdigest()
 
-    Solves:
+
+def _build_reduced_functionals(
+    pts: np.ndarray,
+    cells: np.ndarray,
+    dirichlet_mask_vals: np.ndarray,
+    dirichlet_values_vals: np.ndarray,
+    neumann_mask_vals: np.ndarray,
+    neumann_values_vals: np.ndarray,
+    k_max: float,
+    p_exp: float,
+    target_temperature: np.ndarray,
+) -> dict[str, Any]:
+    """One-time setup for a (mesh, BC, material, target) combination: mesh,
+    function spaces, ONE annotated forward solve with rho/source as
+    controls, wrapped as two ReducedFunctionals sharing that tape.
+
+    Solves the 3-D steady-state heat conduction topology optimisation problem:
         -∇·(k(ρ) ∇T) = 0    in Ω
 
     with SIMP conductivity:
@@ -191,59 +282,44 @@ def _solve_heat(
     Thermal compliance objective:
         C = ∮_Γ_N q_n · T dΓ
 
-    The gradient ∂C/∂ρ is computed via dolfin-adjoint's ReducedFunctional.
-
-    Args:
-        rho_values: Active per-cell density, shape (n_cells,), values in [0, 1].
-        pts: Mesh node coordinates, shape (n_nodes, 3).
-        cells: Hex cell connectivity, shape (n_cells, 8).
-        dirichlet_mask_vals: Per-node Dirichlet group index, shape (n_nodes,).
-        dirichlet_values_vals: Per-group prescribed temperature, shape (n_groups, 1).
-        neumann_mask_vals: Per-node Neumann group index, shape (n_nodes,).
-        neumann_values_vals: Per-group heat flux, shape (n_neumann_groups, 1).
-        k_max: Maximum thermal conductivity.
-        p_exp: SIMP penalisation exponent.
-        compute_gradient: If True, compute ∂C/∂ρ via dolfin-adjoint.
-        source_values: Per-cell volumetric heat source (W/m³), shape (n_cells,).
-            Added to the FEM RHS as ∫_Ω f·v dΩ.  None or zeros → no body source.
-        compute_rho_id_gradient: If True, compute ∂I/∂ρ (identification_error)
-            via dolfin-adjoint.  Requires target_temperature.
-        target_temperature: Nodal target temperature, shape (n_nodes,), used
-            when compute_rho_id_gradient=True.
+    Identification-error objective (area-weighted proxy for the nodal
+    ``sum((T - T_target)^2)`` computed in `apply`; see the nodal-correction
+    comment below):
+        I = ∫_Ω (T - T_target)² dΩ
 
     Returns:
-        Tuple (J_val, T_vertices, dJ_drho, dI_drho) where:
-            J_val: Scalar thermal compliance value.
-            T_vertices: Temperature at mesh vertices, shape (n_vertices,).
-            dJ_drho: Gradient ∂C/∂ρ, shape (n_cells,), or None if
-                     compute_gradient=False.
-            dI_drho: Gradient ∂I/∂ρ, shape (n_cells,), or None if
-                     compute_rho_id_gradient=False.
+        ``{"Chat", "Ihat", "rho_space", "fenics_to_input", "mesh", "T_sol",
+        "nodal_correction"}`` — see module docstring above for how these get
+        reused at every later (rho, source).
     """
-    # Fresh tape for every solve — prevents stale gradient accumulation.
-    set_working_tape(Tape())
-
     mesh = _build_fenics_mesh(pts, cells)
     fenics_to_input = _cell_reorder_map(pts, cells, mesh)
 
-    # ---- Function spaces --------------------------------------------------
     # P1 (CG degree 1) for temperature; DG0 for piecewise-constant density.
     V = FunctionSpace(mesh, "CG", 1)
     DG0 = FunctionSpace(mesh, "DG", 0)
+    neumann_facet_markers = _mark_neumann_facets(mesh, neumann_mask_vals)
+    # DOLFIN 2019.1.0 requires a facet MeshFunction (not vertex) for
+    # DirichletBC.  A boundary facet is assigned Dirichlet group k if ALL
+    # of its vertices carry dirichlet_mask == k.  This is identical to the
+    # Neumann facet marking logic.
+    dirichlet_facet_markers = _mark_neumann_facets(mesh, dirichlet_mask_vals)
 
-    # ---- Density field ----------------------------------------------------
-    rho = Function(DG0, name="rho")
-    rho_vec = np.clip(rho_values[fenics_to_input], 0.0, 1.0)
-    rho.vector()[:] = rho_vec
+    set_working_tape(Tape())
+
+    # ---- Density & source fields (arbitrary initial values — every `apply`
+    # replays this graph at the real (rho, source) via `Chat([rho, source])`)
+    rho_fn = Function(DG0, name="rho")
+    rho_fn.vector()[:] = 0.5
+    source_fn = Function(DG0, name="source")
+    source_fn.vector()[:] = 0.0
 
     # ---- SIMP conductivity ------------------------------------------------
     # k(ρ) = k_min + (k_max − k_min) · ρ^p,  k_min = 1e-3 · k_max
     k_min = Constant(1e-3 * k_max)
-    k_simp = k_min + (Constant(k_max) - k_min) * rho**p_exp
+    k_simp = k_min + (Constant(k_max) - k_min) * rho_fn**p_exp
 
-    # ---- Neumann facet markers -------------------------------------------
-    facet_markers = _mark_neumann_facets(mesh, neumann_mask_vals)
-    ds_N = Measure("ds", domain=mesh, subdomain_data=facet_markers)
+    ds_N = Measure("ds", domain=mesh, subdomain_data=neumann_facet_markers)
 
     # ---- Variational problem ----------------------------------------------
     T = TrialFunction(V)
@@ -260,35 +336,23 @@ def _solve_heat(
         q_n = Constant(float(neumann_values_vals[k, 0]))
         L = L + q_n * v * ds_N(k + 1)
 
-    # Body heat source: ∫_Ω f · v dΩ
-    # source_values is per-element (DG0); project to DG0 and add to RHS.
-    if source_values is not None and np.any(source_values != 0.0):
-        source_dg0 = Function(DG0, name="source")
-        n_cells_f = mesh.num_cells()
-        src_reordered = np.zeros(n_cells_f, dtype=np.float64)
-        for fd_idx in range(n_cells_f):
-            inp_idx = int(fenics_to_input[fd_idx])
-            if inp_idx < len(source_values):
-                src_reordered[fd_idx] = float(source_values[inp_idx])
-        source_dg0.vector()[:] = src_reordered
-        L = L + source_dg0 * v * dx
+    # Body heat source: ∫_Ω f · v dΩ.
+    L = L + source_fn * v * dx
 
     # ---- Dirichlet BCs ---------------------------------------------------
-    # DOLFIN 2019.1.0 requires a facet MeshFunction (not vertex) for
-    # DirichletBC.  A boundary facet is assigned Dirichlet group k if ALL
-    # of its vertices carry dirichlet_mask == k.  This is identical to the
-    # Neumann facet marking logic.
-    dirichlet_facet_markers = _mark_neumann_facets(mesh, dirichlet_mask_vals)
-
     bcs = []
     for k in range(dirichlet_values_vals.shape[0]):
         T_prescribed = Constant(float(dirichlet_values_vals[k, 0]))
         bc = DirichletBC(V, T_prescribed, dirichlet_facet_markers, k + 1)
         bcs.append(bc)
 
-    # ---- Solve -----------------------------------------------------------
+    # ---- Solve -------------------------------------------------------------
+    # mumps: UMFPACK (the FEniCS default) runs out of memory at moderate mesh
+    # sizes; the adjoint solve picks this up too (see the mumps patch above).
+    # This `solver_parameters` choice is captured on the Block and reused by
+    # every later replay automatically.
     T_sol = Function(V)
-    solve(a == L, T_sol, bcs)
+    solve(a == L, T_sol, bcs, solver_parameters={"linear_solver": "mumps"})
 
     # ---- Objective: thermal compliance ------------------------------------
     # C = ∮_Γ_N q_n · T dΓ
@@ -299,109 +363,157 @@ def _solve_heat(
         J_form = J_form + q_n * T_sol * ds_N(k + 1)
     J = assemble(J_form)
 
-    # ---- Temperature at vertices -----------------------------------------
-    # compute_vertex_values returns a flat array of length n_vertices.
-    T_vertices = T_sol.compute_vertex_values(mesh)
+    # ---- Objective: identification error -----------------------------------
+    # Built on the same tape/T_sol — replaying `Chat` also refreshes this.
+    T_target_fn = Function(V)
+    d2v = dof_to_vertex_map(V)
+    T_tgt = np.asarray(target_temperature, dtype=np.float64)
+    target_at_dofs = np.zeros(V.dim(), dtype=np.float64)
+    for dof_i in range(V.dim()):
+        vert_i = int(d2v[dof_i])
+        if vert_i < len(T_tgt):
+            target_at_dofs[dof_i] = float(T_tgt[vert_i])
+    T_target_fn.vector()[:] = target_at_dofs
+    diff = T_sol - T_target_fn
+    I = assemble(inner(diff, diff) * dx)
 
-    # ---- Gradient via adjoint --------------------------------------------
-    dJ_drho = None
-    if compute_gradient:
-        Jhat = ReducedFunctional(J, Control(rho))
-        dJ_fenics = Jhat.derivative()
-        dJ_fenics_vec = dJ_fenics.vector().get_local().copy()
+    # Nodal correction: identification_error (forward) = sum(nodal diff^2),
+    # while dolfin-adjoint differentiates ∫(T-T_t)² dΩ (area-weighted).
+    coords = mesh.coordinates()
+    domain_vol = float(
+        np.prod([coords[:, i].max() - coords[:, i].min() for i in range(coords.shape[1])])
+    )
+    nodal_correction = float(mesh.num_vertices()) / domain_vol
 
-        # Map FEniCS DG0 DOF order → input cell order.
-        dJ_input = np.zeros(len(rho_values))
-        dJ_input[fenics_to_input] = dJ_fenics_vec
-        dJ_drho = dJ_input
+    controls = [Control(rho_fn), Control(source_fn)]
+    Chat = ReducedFunctional(J, controls)
+    Ihat = ReducedFunctional(I, [Control(rho_fn), Control(source_fn)])
 
-    # ---- Gradient of identification_error w.r.t. rho --------------------
-    dI_drho = None
-    if compute_rho_id_gradient and target_temperature is not None:
-        # Fresh tape — rho2 must be created AFTER set_working_tape.
-        set_working_tape(Tape())
+    return {
+        "Chat": Chat,
+        "Ihat": Ihat,
+        "rho_space": DG0,
+        "fenics_to_input": fenics_to_input,
+        "mesh": mesh,
+        "T_sol": T_sol,
+        "nodal_correction": nodal_correction,
+    }
 
-        mesh2 = _build_fenics_mesh(pts, cells)
-        fenics_to_input2 = _cell_reorder_map(pts, cells, mesh2)
 
-        V2 = FunctionSpace(mesh2, "CG", 1)
-        DG0_2 = FunctionSpace(mesh2, "DG", 0)
+def _get_reduced_functionals(
+    pts: np.ndarray,
+    cells: np.ndarray,
+    dirichlet_mask_vals: np.ndarray,
+    dirichlet_values_vals: np.ndarray,
+    neumann_mask_vals: np.ndarray,
+    neumann_values_vals: np.ndarray,
+    k_max: float,
+    p_exp: float,
+    target_temperature: np.ndarray,
+) -> dict[str, Any]:
+    """Build (or fetch) the cached Chat/Ihat pair for this (mesh, BC,
+    material, target_temperature) combination."""
+    key = _setup_cache_key(
+        pts,
+        cells,
+        dirichlet_mask_vals,
+        dirichlet_values_vals,
+        neumann_mask_vals,
+        neumann_values_vals,
+        k_max,
+        p_exp,
+        target_temperature,
+    )
+    entry = _SETUP_CACHE.get(key)
+    if entry is not None:
+        return entry
 
-        rho2 = Function(DG0_2, name="rho2")
-        rho_vec2 = np.clip(rho_values[fenics_to_input2], 0.0, 1.0)
-        rho2.vector()[:] = rho_vec2
+    entry = _build_reduced_functionals(
+        pts,
+        cells,
+        dirichlet_mask_vals,
+        dirichlet_values_vals,
+        neumann_mask_vals,
+        neumann_values_vals,
+        k_max,
+        p_exp,
+        target_temperature,
+    )
+    _SETUP_CACHE.clear()
+    _SETUP_CACHE[key] = entry
+    return entry
 
-        k_min2 = Constant(1e-3 * k_max)
-        k_simp2 = k_min2 + (Constant(k_max) - k_min2) * rho2**p_exp
 
-        facet_markers2 = _mark_neumann_facets(mesh2, neumann_mask_vals)
-        ds_N2 = Measure("ds", domain=mesh2, subdomain_data=facet_markers2)
+def _gradient_pair(reduced_functional: Any, n_input_cells: int, fenics_to_input: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(d/drho, d/dsource) from one adjoint sweep, mapped to input cell order."""
+    d_rho_fn, d_source_fn = reduced_functional.derivative()
+    d_rho = np.zeros(n_input_cells)
+    d_rho[fenics_to_input] = d_rho_fn.vector().get_local()
+    d_source = np.zeros(n_input_cells)
+    d_source[fenics_to_input] = d_source_fn.vector().get_local()
+    return d_rho, d_source
 
-        T2_trial = TrialFunction(V2)
-        v2_test = TestFunction(V2)
-        a2 = inner(k_simp2 * grad(T2_trial), grad(v2_test)) * dx
-        n_neumann_groups2 = neumann_values_vals.shape[0]
-        L2 = Constant(0.0) * v2_test * dx
-        for k in range(n_neumann_groups2):
-            q_n2 = Constant(float(neumann_values_vals[k, 0]))
-            L2 = L2 + q_n2 * v2_test * ds_N2(k + 1)
-        if source_values is not None and np.any(source_values != 0.0):
-            source_dg0_2 = Function(DG0_2, name="source2")
-            n_cells_f2 = mesh2.num_cells()
-            src_reordered2 = np.zeros(n_cells_f2, dtype=np.float64)
-            for fd_idx2 in range(n_cells_f2):
-                inp_idx2 = int(fenics_to_input2[fd_idx2])
-                if inp_idx2 < len(source_values):
-                    src_reordered2[fd_idx2] = float(source_values[inp_idx2])
-            source_dg0_2.vector()[:] = src_reordered2
-            L2 = L2 + source_dg0_2 * v2_test * dx
 
-        dirichlet_facet_markers2 = _mark_neumann_facets(mesh2, dirichlet_mask_vals)
-        bcs2 = []
-        for k in range(dirichlet_values_vals.shape[0]):
-            T_prescribed2 = Constant(float(dirichlet_values_vals[k, 0]))
-            bc2 = DirichletBC(V2, T_prescribed2, dirichlet_facet_markers2, k + 1)
-            bcs2.append(bc2)
+def _solve_forward(
+    rho_values: np.ndarray,
+    source_values: np.ndarray,
+    pts: np.ndarray,
+    cells: np.ndarray,
+    dirichlet_mask_vals: np.ndarray,
+    dirichlet_values_vals: np.ndarray,
+    neumann_mask_vals: np.ndarray,
+    neumann_values_vals: np.ndarray,
+    k_max: float,
+    p_exp: float,
+    target_temperature: np.ndarray,
+) -> dict[str, Any]:
+    """Evaluate thermal_compliance at this (rho, source) by replaying the
+    cached `Chat` (which also refreshes `Ihat`'s shared tape state — see
+    module docstring above).
+    """
+    entry = _get_reduced_functionals(
+        pts,
+        cells,
+        dirichlet_mask_vals,
+        dirichlet_values_vals,
+        neumann_mask_vals,
+        neumann_values_vals,
+        k_max,
+        p_exp,
+        target_temperature,
+    )
+    fenics_to_input = entry["fenics_to_input"]
+    n_cells_f = len(fenics_to_input)
 
-        T_sol2 = Function(V2)
-        solve(a2 == L2, T_sol2, bcs2)
+    rho_fn = Function(entry["rho_space"])
+    rho_fn.vector()[:] = np.clip(rho_values[fenics_to_input], 0.0, 1.0)
 
-        # Build target-temperature P1 function in FEniCS DOF order.
-        T_target_fn = Function(V2)
-        T_tgt = np.asarray(target_temperature, dtype=np.float64)
-        d2v2 = dof_to_vertex_map(V2)
-        target_at_dofs2 = np.zeros(V2.dim(), dtype=np.float64)
-        for dof_i in range(V2.dim()):
-            vert_i = int(d2v2[dof_i])
-            if vert_i < len(T_tgt):
-                target_at_dofs2[dof_i] = float(T_tgt[vert_i])
-        T_target_fn.vector()[:] = target_at_dofs2
+    source_fn = Function(entry["rho_space"])
+    src_reordered = np.zeros(n_cells_f, dtype=np.float64)
+    for fd_idx in range(n_cells_f):
+        inp_idx = int(fenics_to_input[fd_idx])
+        if inp_idx < len(source_values):
+            src_reordered[fd_idx] = float(source_values[inp_idx])
+    source_fn.vector()[:] = src_reordered
 
-        # Nodal correction: identification_error (forward) = sum(nodal diff^2),
-        # while dolfin-adjoint differentiates ∫(T-T_t)² dΩ (area-weighted).
-        coords2 = mesh2.coordinates()
-        domain_vol2 = float(
-            np.prod(
-                [
-                    coords2[:, i].max() - coords2[:, i].min()
-                    for i in range(coords2.shape[1])
-                ]
-            )
-        )
-        n_nodes_mesh2 = mesh2.num_vertices()
-        nodal_correction2 = float(n_nodes_mesh2) / domain_vol2
+    J = entry["Chat"]([rho_fn, source_fn])
+    # `entry["T_sol"]` is the Python object from the ONE-TIME setup solve;
+    # dolfin-adjoint's replay creates a fresh Function each time (see
+    # `GenericSolveBlock._create_initial_guess`) and stores the result on the
+    # ORIGINAL block_variable's checkpoint rather than mutating that first
+    # object in place, so the current value must be read back through it.
+    T_current = entry["T_sol"].block_variable.saved_output
+    T_vertices = T_current.compute_vertex_values(entry["mesh"])
 
-        diff2 = T_sol2 - T_target_fn
-        I2 = assemble(inner(diff2, diff2) * dx)
-        Ihat2 = ReducedFunctional(I2, Control(rho2))
-        dI_fenics2 = Ihat2.derivative()
-        dI_fenics_vec2 = dI_fenics2.vector().get_local().copy() * nodal_correction2
-
-        dI_input2 = np.zeros(len(rho_values))
-        dI_input2[fenics_to_input2] = dI_fenics_vec2
-        dI_drho = dI_input2
-
-    return float(J), T_vertices, dJ_drho, dI_drho
+    return {
+        "Chat": entry["Chat"],
+        "Ihat": entry["Ihat"],
+        "J": J,
+        "T_vertices": T_vertices,
+        "fenics_to_input": fenics_to_input,
+        "n_input_cells": len(rho_values),
+        "nodal_correction": entry["nodal_correction"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -439,8 +551,9 @@ def apply(inputs: InputSchema) -> OutputSchema:
         bc.neumann.values if bc.neumann else np.zeros((0, 1)), dtype=np.float64
     )
 
-    J_val, T_verts, _, _ = _solve_heat(
+    state = _solve_forward(
         rho_values,
+        source_values,
         pts,
         cells,
         dm,
@@ -449,16 +562,15 @@ def apply(inputs: InputSchema) -> OutputSchema:
         vv,
         inputs.k_max,
         inputs.p_exp,
-        compute_gradient=False,
-        source_values=source_values,
+        np.asarray(inputs.target_temperature, dtype=np.float64),
     )
 
-    T_f32 = T_verts.astype(np.float32)
+    T_f32 = state["T_vertices"].astype(np.float32)
     n = min(len(T_f32), len(target_temp))
     id_error = np.float32(np.sum((T_f32[:n] - target_temp[:n]) ** 2))
 
     return OutputSchema(
-        thermal_compliance=np.float32(J_val),
+        thermal_compliance=np.float32(float(state["J"])),
         identification_error=id_error,
     )
 
@@ -469,16 +581,21 @@ def vector_jacobian_product(
     vjp_outputs: set[str],
     cotangent_vector: dict[str, Any],
 ) -> dict[str, Any]:
-    """VJP via dolfin-adjoint: ∂C/∂ρ and ∂id_err/∂source scaled by cotangents.
+    """VJP via dolfin-adjoint: ∂C/∂ρ, ∂C/∂source, ∂id_err/∂ρ, ∂id_err/∂source.
 
-    Re-runs the forward solve with gradient tracking enabled and uses
-    dolfin-adjoint's ReducedFunctional to compute adjoint sensitivities.
-    Results are scaled by incoming cotangents and padded to match the
-    capacity of the full input arrays.
+    Self-contained, matching every other differentiable solver in the suite:
+    replays the forward problem at the (rho, source) it is given and then
+    computes the adjoint(s), rather than reusing a solution cached by a
+    preceding ``apply`` call — see the module docstring above for why. The
+    replay reuses the cached mesh/function spaces and the compiled UFL
+    forms, so no mesh rebuild or form reconstruction happens. Each
+    functional carries both controls, so one ``.derivative()`` call yields
+    both ``d/drho`` and ``d/dsource`` from a single adjoint sweep.
 
     Supports:
         rho    → thermal_compliance  (SIMP adjoint via dolfin-adjoint)
         rho    → identification_error (SIMP adjoint on ||T-T_target||² functional)
+        source → thermal_compliance
         source → identification_error (nodal L2 adjoint with area correction)
 
     Args:
@@ -513,197 +630,55 @@ def vector_jacobian_product(
     vv = np.asarray(
         bc.neumann.values if bc.neumann else np.zeros((0, 1)), dtype=np.float64
     )
+    state = _solve_forward(
+        rho_values,
+        source_values,
+        pts,
+        cells,
+        dm,
+        dv,
+        vm,
+        vv,
+        inputs.k_max,
+        inputs.p_exp,
+        np.asarray(inputs.target_temperature, dtype=np.float64),
+    )
 
+    n_input_cells = state["n_input_cells"]
+    fenics_to_input = state["fenics_to_input"]
     result = {}
+    grad_rho = np.zeros(len(np.asarray(inputs.rho)), dtype=np.float32) if want_rho else None
+    grad_source = (
+        np.zeros(len(np.asarray(inputs.source)), dtype=np.float32) if want_source else None
+    )
 
-    # ------------------------------------------------------------------
-    # rho → thermal_compliance and/or rho → identification_error gradient
-    # ------------------------------------------------------------------
+    # One adjoint sweep per objective (not per control): each ReducedFunctional
+    # carries both [rho, source] controls, so `.derivative()` yields both
+    # gradients at once.
+    cot_compliance = float(cotangent_vector.get("thermal_compliance", 0.0))
+    if cot_compliance != 0.0:
+        dC_drho, dC_dsource = _gradient_pair(state["Chat"], n_input_cells, fenics_to_input)
+        if want_rho:
+            grad_rho[: hm.n_faces] += (dC_drho * cot_compliance).astype(np.float32)
+        if want_source:
+            grad_source[: hm.n_faces] += (dC_dsource * cot_compliance).astype(np.float32)
+
+    cot_id_error = float(cotangent_vector.get("identification_error", 0.0))
+    if cot_id_error != 0.0:
+        dI_drho, dI_dsource = _gradient_pair(state["Ihat"], n_input_cells, fenics_to_input)
+        nodal_correction = state["nodal_correction"]
+        if want_rho:
+            grad_rho[: hm.n_faces] += (
+                dI_drho * nodal_correction * cot_id_error
+            ).astype(np.float32)
+        if want_source:
+            grad_source[: hm.n_faces] += (
+                dI_dsource * nodal_correction * cot_id_error
+            ).astype(np.float32)
 
     if want_rho:
-        cot_compliance_rho = float(cotangent_vector.get("thermal_compliance", 0.0))
-        cot_id_error_rho = float(cotangent_vector.get("identification_error", 0.0))
-        want_rho_id = want_rho and cot_id_error_rho != 0.0
-        target_temp_rho = (
-            np.asarray(inputs.target_temperature, dtype=np.float64)
-            if want_rho_id
-            else None
-        )
-
-        _, _, dJ_drho, dI_drho = _solve_heat(
-            rho_values,
-            pts,
-            cells,
-            dm,
-            dv,
-            vm,
-            vv,
-            inputs.k_max,
-            inputs.p_exp,
-            compute_gradient=cot_compliance_rho != 0.0,
-            source_values=source_values,
-            compute_rho_id_gradient=want_rho_id,
-            target_temperature=target_temp_rho,
-        )
-
-        grad_rho = np.zeros(len(np.asarray(inputs.rho)), dtype=np.float32)
-        if dJ_drho is not None and cot_compliance_rho != 0.0:
-            grad_rho[: hm.n_faces] += (dJ_drho * cot_compliance_rho).astype(np.float32)
-        if dI_drho is not None and cot_id_error_rho != 0.0:
-            grad_rho[: hm.n_faces] += (dI_drho * cot_id_error_rho).astype(np.float32)
         result["rho"] = grad_rho
-
-    # ------------------------------------------------------------------
-    # source → identification_error  AND  source → thermal_compliance
-    # ------------------------------------------------------------------
-
     if want_source:
-        cot_src = float(cotangent_vector.get("identification_error", 0.0))
-        cot_tc = float(cotangent_vector.get("thermal_compliance", 0.0))
-
-        grad_source = np.zeros(len(np.asarray(inputs.source)), dtype=np.float32)
-
-        if cot_src != 0.0 or cot_tc != 0.0:
-            # Fresh tape — source_dg0 must be created AFTER set_working_tape.
-            set_working_tape(Tape())
-
-            mesh = _build_fenics_mesh(pts, cells)
-            fenics_to_input = _cell_reorder_map(pts, cells, mesh)
-
-            V = FunctionSpace(mesh, "CG", 1)
-            DG0 = FunctionSpace(mesh, "DG", 0)
-
-            # ---- Density field (not a control here) ----------------------
-            rho_fn = Function(DG0, name="rho")
-            rho_vec = np.clip(rho_values[fenics_to_input], 0.0, 1.0)
-            rho_fn.vector()[:] = rho_vec
-
-            # ---- SIMP conductivity ----------------------------------------
-            k_min = Constant(1e-3 * inputs.k_max)
-            k_simp = k_min + (Constant(inputs.k_max) - k_min) * rho_fn**inputs.p_exp
-
-            # ---- Neumann facet markers ------------------------------------
-            facet_markers = _mark_neumann_facets(mesh, vm)
-            ds_N = Measure("ds", domain=mesh, subdomain_data=facet_markers)
-
-            # ---- Source field as the adjoint control ----------------------
-            source_dg0 = Function(DG0, name="source")
-            n_cells_f = mesh.num_cells()
-            src_reordered = np.zeros(n_cells_f, dtype=np.float64)
-            for fd_idx in range(n_cells_f):
-                inp_idx = int(fenics_to_input[fd_idx])
-                if inp_idx < len(source_values):
-                    src_reordered[fd_idx] = float(source_values[inp_idx])
-            source_dg0.vector()[:] = src_reordered
-            source_ctrl = Control(source_dg0)
-
-            # ---- Variational problem with source on the tape --------------
-            T_trial = TrialFunction(V)
-            v_test = TestFunction(V)
-
-            a = inner(k_simp * grad(T_trial), grad(v_test)) * dx
-
-            n_neumann_groups = vv.shape[0]
-            L = Constant(0.0) * v_test * dx
-            for k in range(n_neumann_groups):
-                q_n = Constant(float(vv[k, 0]))
-                L = L + q_n * v_test * ds_N(k + 1)
-            L = L + source_dg0 * v_test * dx
-
-            # ---- Dirichlet BCs -------------------------------------------
-            dirichlet_facet_markers = _mark_neumann_facets(mesh, dm)
-            bcs = []
-            for k in range(dv.shape[0]):
-                T_prescribed = Constant(float(dv[k, 0]))
-                bc_obj = DirichletBC(V, T_prescribed, dirichlet_facet_markers, k + 1)
-                bcs.append(bc_obj)
-
-            # ---- Solve ---------------------------------------------------
-            T_sol = Function(V)
-            solve(a == L, T_sol, bcs)
-
-            # ---- Nodal correction factor (matches firedrake fix) -----------
-            # identification_error = sum((T_nodes - T_target)^2)  (nodal, no area)
-            # J_id (dolfin-adjoint) = integral((T-T_t)^2 dΩ)     (area-weighted)
-            # Correction: nodal_correction = n_nodes / domain_vol
-            coords = mesh.coordinates()  # numpy array (n_vertices, 3)
-            domain_vol = float(
-                np.prod(
-                    [
-                        coords[:, i].max() - coords[:, i].min()
-                        for i in range(coords.shape[1])
-                    ]
-                )
-            )
-            n_nodes_mesh = mesh.num_vertices()
-            nodal_correction = float(n_nodes_mesh) / domain_vol
-
-            # ---- Branch: ∂(identification_error)/∂source -----------------
-            if cot_src != 0.0:
-                # ---- Target temperature as P1 function -------------------
-                target_temp = np.asarray(inputs.target_temperature, dtype=np.float64)
-                T_target_fn = Function(V)
-                # Map nodal target values: FEniCS vertex ordering may differ from input.
-                # Use compute_vertex_values-style assignment via dof_to_vertex_map.
-                d2v = dof_to_vertex_map(V)
-                target_at_dofs = np.zeros(V.dim(), dtype=np.float64)
-                for dof_i in range(V.dim()):
-                    vert_i = int(d2v[dof_i])
-                    if vert_i < len(target_temp):
-                        target_at_dofs[dof_i] = float(target_temp[vert_i])
-                T_target_fn.vector()[:] = target_at_dofs
-
-                # ---- Identification error functional (Galerkin) -----------
-                diff = T_sol - T_target_fn
-                J_id = assemble(inner(diff, diff) * dx)
-
-                # ---- Adjoint differentiation for identification_error -----
-                Jhat_id = ReducedFunctional(J_id, source_ctrl)
-                dJ_src_fenics = Jhat_id.derivative()
-                dJ_src_vec = (
-                    dJ_src_fenics.vector().get_local().copy() * nodal_correction
-                )
-
-                # ---- Map FEniCS DG0 DOF order → input cell order ---------
-                dJ_src_input = np.zeros(hm.n_faces, dtype=np.float64)
-                for fenics_cell in range(len(fenics_to_input)):
-                    inp_cell = int(fenics_to_input[fenics_cell])
-                    if inp_cell < hm.n_faces:
-                        dJ_src_input[inp_cell] = dJ_src_vec[fenics_cell]
-
-                grad_source[: hm.n_faces] += (dJ_src_input * cot_src).astype(np.float32)
-
-            # ---- Branch: ∂(thermal_compliance)/∂source -------------------
-            # thermal_compliance C = ∮_ΓN q_n T dΓ  (Neumann surface integral,
-            # same functional used in _solve_heat).
-            # Adjoint: K λ = ∂C/∂T = q_n δ_ΓN  (same as Neumann RHS vector)
-            # → adjoint solution λ satisfies K λ = f_Neumann  (same RHS as primal
-            #   when source is zero), i.e. λ = K^{-1} f_Neumann.
-            # ∂C/∂source_e = λ^T · ∂f/∂source_e = sum_i(λ_i * vol_e / n_nodes)
-            # Computed via dolfin-adjoint ReducedFunctional with J_c = ∮_ΓN q_n T dΓ.
-            if cot_tc != 0.0:
-                J_c_form = Constant(0.0) * T_sol * dx
-                for k in range(n_neumann_groups):
-                    q_n = Constant(float(vv[k, 0]))
-                    J_c_form = J_c_form + q_n * T_sol * ds_N(k + 1)
-                J_c = assemble(J_c_form)
-
-                # ---- Adjoint differentiation for thermal_compliance -------
-                Jhat_c = ReducedFunctional(J_c, source_ctrl)
-                dJ_c_src_fenics = Jhat_c.derivative()
-                dJ_c_src_vec = dJ_c_src_fenics.vector().get_local().copy()
-
-                # ---- Map FEniCS DG0 DOF order → input cell order ---------
-                dJ_c_src_input = np.zeros(hm.n_faces, dtype=np.float64)
-                for fenics_cell in range(len(fenics_to_input)):
-                    inp_cell = int(fenics_to_input[fenics_cell])
-                    if inp_cell < hm.n_faces:
-                        dJ_c_src_input[inp_cell] = dJ_c_src_vec[fenics_cell]
-
-                grad_source[: hm.n_faces] += (dJ_c_src_input * cot_tc).astype(
-                    np.float32
-                )
-
         result["source"] = grad_source
 
     return result

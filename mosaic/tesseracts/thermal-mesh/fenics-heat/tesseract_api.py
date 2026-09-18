@@ -180,10 +180,10 @@ def _mark_neumann_facets(mesh: Mesh, neumann_mask_vals: np.ndarray) -> MeshFunct
 # Core solver
 # ---------------------------------------------------------------------------
 #
-# `_SETUP_CACHE` holds a persistent, replayable pair of `ReducedFunctional`s
-# — thermal compliance (`Chat`) and identification error (`Ihat`), each with
-# controls ``[rho, source]`` — per (mesh, BC, material, target_temperature)
-# combination, i.e. everything the problem depends on *except* rho/source.
+# `_SETUP_CACHE` holds a persistent, replayable thermal-compliance
+# `ReducedFunctional` (`Chat`, with controls ``[rho, source]``) per (mesh, BC,
+# material, target_temperature) combination, i.e. everything the problem
+# depends on *except* rho/source.
 # Building it does ONE real solve. Every later evaluation at a different
 # rho/source — the entire point of a topology-optimisation or source-
 # identification run, which calls `apply` thousands of times against the
@@ -193,24 +193,16 @@ def _mark_neumann_facets(mesh: Mesh, neumann_mask_vals: np.ndarray) -> MeshFunct
 # / `Tape.reset_blocks`). This reuses the compiled UFL forms and re-solves
 # the *linear system* but skips reconstructing Constants/Measures/
 # DirichletBCs/forms from Python and re-hitting FFC's JIT-compile cache
-# lookup on every call. `Chat` and `Ihat` share one tape built from one
-# solve, so replaying `Chat` also refreshes every block `Ihat` needs
-# (`Tape.reset_blocks`/`get_blocks` operate on the whole tape, not per
-# functional) — one replay serves both objectives. So rho/source are plain
-# arguments here, never part of a cache key — the cached object is a pair of
-# functionals that can be replayed at any (rho, source), not a solve at one
-# point.
+# lookup on every call. So rho/source are plain arguments here, never part
+# of a cache key: the cached object is a functional that can be replayed at
+# any (rho, source), not a solve at one point.
 #
-# Each `ReducedFunctional` carries both controls, so `.derivative()`
-# returns `[d/drho, d/dsource]` from a single adjoint sweep. The adjoint
-# method's cost is ~independent of the number of controls, so this is one
-# backward pass instead of two. The one exception is
-# d(identification_error)/d(source): the forward reports identification_error
-# as a nodal sum but `Ihat` differentiates the area-weighted `∫(T-T_t)² dΩ`,
-# and the per-node lumped mass that reconciles the two sits inside the
-# contraction over nodes, so no single scalar undoes it (it does,
-# approximately, for rho). That path uses an exact nodal-seeded adjoint
-# instead, in `_source_id_error_gradient`.
+# `Chat` carries both controls, so `.derivative()` returns
+# `[d/drho, d/dsource]` from a single adjoint sweep. The adjoint method's
+# cost is ~independent of the number of controls, so this is one backward
+# pass instead of two. identification_error is reported as a nodal sum
+# rather than an integral, so both of its gradients come from one adjoint
+# seeded with the nodal residual instead, in `_id_error_gradients`.
 #
 # `vector_jacobian_product` is self-contained: it replays
 # `Chat([rho, source])` at the point it was handed and then takes the
@@ -243,7 +235,7 @@ def _setup_cache_key(
     p_exp: float,
     target_temperature: np.ndarray,
 ) -> str:
-    """Hash everything the Chat/Ihat graphs depend on.
+    """Hash everything the Chat graph and the identification target depend on.
 
     That is everything except rho/source, which `Chat([rho, source])`
     replays the graph at.
@@ -293,15 +285,13 @@ def _build_reduced_functionals(
     Thermal compliance objective:
         C = ∮_Γ_N q_n · T dΓ
 
-    Identification-error objective (area-weighted proxy for the nodal
-    ``sum((T - T_target)^2)`` computed in `apply`; see the nodal-correction
-    comment below):
-        I = ∫_Ω (T - T_target)² dΩ
+    Identification-error objective, computed in `apply`:
+        I = Σ_nodes (T - T_target)²
 
     Returns:
-        ``{"Chat", "Ihat", "rho_space", "fenics_to_input", "mesh", "T_sol",
-        "nodal_correction"}`` — see module docstring above for how these get
-        reused at every later (rho, source).
+        ``{"Chat", "rho_space", "fenics_to_input", "mesh", "T_sol"}``; see the
+        module docstring above for how these get reused at every later
+        (rho, source).
     """
     mesh = _build_fenics_mesh(pts, cells)
     fenics_to_input = _cell_reorder_map(pts, cells, mesh)
@@ -375,7 +365,6 @@ def _build_reduced_functionals(
     J = assemble(J_form)
 
     # ---- Objective: identification error -----------------------------------
-    # Built on the same tape/T_sol — replaying `Chat` also refreshes this.
     T_target_fn = Function(V)
     d2v = dof_to_vertex_map(V)
     T_tgt = np.asarray(target_temperature, dtype=np.float64)
@@ -385,22 +374,8 @@ def _build_reduced_functionals(
         if vert_i < len(T_tgt):
             target_at_dofs[dof_i] = float(T_tgt[vert_i])
     T_target_fn.vector()[:] = target_at_dofs
-    diff = T_sol - T_target_fn
-    id_error_functional = assemble(inner(diff, diff) * dx)
 
-    # `n_nodes / domain_vol` rescales the area-weighted `Ihat` gradient onto the
-    # forward's nodal-sum identification_error. Only an approximate lumped-mass
-    # rescale, but accurate enough for the rho gradient; the source gradient
-    # cannot use it and takes a separate path (`_source_id_error_gradient`).
-    coords = mesh.coordinates()
-    domain_vol = float(
-        np.prod(
-            [coords[:, i].max() - coords[:, i].min() for i in range(coords.shape[1])]
-        )
-    )
-    nodal_correction = float(mesh.num_vertices()) / domain_vol
-
-    # Homogeneous BCs for the nodal-seeded source adjoint solve (below): the
+    # Homogeneous BCs for the nodal-seeded adjoint solve (below): the
     # same Dirichlet groups as the primal, but with a zero seed since prescribed
     # nodes carry no identification-error sensitivity.
     hom_dirichlet_bcs = [
@@ -410,11 +385,9 @@ def _build_reduced_functionals(
 
     controls = [Control(rho_fn), Control(source_fn)]
     Chat = ReducedFunctional(J, controls)
-    Ihat = ReducedFunctional(id_error_functional, [Control(rho_fn), Control(source_fn)])
 
     return {
         "Chat": Chat,
-        "Ihat": Ihat,
         "rho_space": DG0,
         "V": V,
         "a": a,
@@ -424,7 +397,6 @@ def _build_reduced_functionals(
         "hom_dirichlet_bcs": hom_dirichlet_bcs,
         "fenics_to_input": fenics_to_input,
         "mesh": mesh,
-        "nodal_correction": nodal_correction,
     }
 
 
@@ -439,7 +411,7 @@ def _get_reduced_functionals(
     p_exp: float,
     target_temperature: np.ndarray,
 ) -> dict[str, Any]:
-    """Build (or fetch) the cached Chat/Ihat pair for this combination.
+    """Build (or fetch) the cached Chat for this combination.
 
     Keyed on (mesh, BC, material, target_temperature).
     """
@@ -486,15 +458,15 @@ def _gradient_pair(
     return d_rho, d_source
 
 
-def _source_id_error_gradient(
+def _id_error_gradients(
     entry: dict[str, Any], rho_values: np.ndarray, n_input_cells: int
-) -> np.ndarray:
-    """Exact ∂(identification_error)/∂source, mapped to input cell order.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Exact ∂(identification_error)/∂(rho, source), mapped to input cell order.
 
-    `Ihat.derivative()` cannot supply this (see the module docstring for why the
-    global `nodal_correction` scalar works for rho but not source). Instead seed
-    the adjoint directly with the nodal residual:
+    The forward reports identification_error as a nodal sum, so the adjoint is
+    seeded directly with the nodal residual:
         A λ = 2(T - T_target),   homogeneous Dirichlet
+        dI/drho_e    = -∫_Ω_e k'(ρ) ∇T·∇λ dΩ   (rho enters through k(ρ) in a)
         dI/dsource_e = ∫_Ω_e λ dΩ   (source enters the residual as source·v·dx)
     This is exact for the nodal functional and independent of the mass lumping.
 
@@ -530,11 +502,16 @@ def _source_id_error_gradient(
     # would try `b.form` on the assembled vector).
     with stop_annotating():
         LUSolver(A_adj).solve(lam.vector(), adjoint_rhs.vector())
+    dI_rho_fenics = assemble(
+        -derivative(action(action(a, T_current), lam), rho_fn)
+    ).get_local()
     dI_src_fenics = assemble(lam * TestFunction(DG0) * dx).get_local()
 
+    dI_rho = np.zeros(n_input_cells)
+    dI_rho[fenics_to_input] = dI_rho_fenics
     dI_source = np.zeros(n_input_cells)
     dI_source[fenics_to_input] = dI_src_fenics
-    return dI_source
+    return dI_rho, dI_source
 
 
 def _solve_forward(
@@ -550,11 +527,7 @@ def _solve_forward(
     p_exp: float,
     target_temperature: np.ndarray,
 ) -> dict[str, Any]:
-    """Evaluate thermal_compliance at this (rho, source) by replaying `Chat`.
-
-    Replaying the cached `Chat` also refreshes `Ihat`'s shared tape state —
-    see module docstring above.
-    """
+    """Evaluate thermal_compliance at this (rho, source) by replaying `Chat`."""
     entry = _get_reduced_functionals(
         pts,
         cells,
@@ -592,12 +565,10 @@ def _solve_forward(
     return {
         "entry": entry,
         "Chat": entry["Chat"],
-        "Ihat": entry["Ihat"],
         "J": J,
         "T_vertices": T_vertices,
         "fenics_to_input": fenics_to_input,
         "n_input_cells": len(rho_values),
-        "nodal_correction": entry["nodal_correction"],
     }
 
 
@@ -673,15 +644,15 @@ def vector_jacobian_product(
     computes the adjoint(s), rather than reusing a solution cached by a
     preceding ``apply`` call — see the module docstring above for why. The
     replay reuses the cached mesh/function spaces and the compiled UFL forms,
-    so no mesh rebuild or form reconstruction happens. Each functional carries
-    both controls, so a single ``.derivative()`` sweep yields both ``d/drho``
-    and ``d/dsource``, except source → identification_error (see below).
+    so no mesh rebuild or form reconstruction happens. ``Chat`` carries both
+    controls, so a single ``.derivative()`` sweep yields both ``d/drho`` and
+    ``d/dsource``; identification_error gets both from one nodal-seeded adjoint.
 
     Supports:
         rho    → thermal_compliance   (SIMP adjoint via dolfin-adjoint)
-        rho    → identification_error (Ihat.derivative() × nodal_correction)
+        rho    → identification_error (exact nodal-seeded adjoint)
         source → thermal_compliance   (Chat.derivative())
-        source → identification_error (exact nodal-seeded adjoint, not rescaled)
+        source → identification_error (exact nodal-seeded adjoint)
 
     Args:
         inputs: Validated InputSchema.
@@ -743,7 +714,7 @@ def vector_jacobian_product(
 
     # Compliance: one adjoint sweep serves both controls — the ReducedFunctional
     # carries [rho, source], so `.derivative()` yields d/drho and d/dsource at
-    # once. (Identification error handles its source gradient separately below.)
+    # once. (Identification error handles both gradients separately below.)
     cot_compliance = float(cotangent_vector.get("thermal_compliance", 0.0))
     if cot_compliance != 0.0:
         dC_drho, dC_dsource = _gradient_pair(
@@ -758,18 +729,12 @@ def vector_jacobian_product(
 
     cot_id_error = float(cotangent_vector.get("identification_error", 0.0))
     if cot_id_error != 0.0:
-        # rho: `Ihat.derivative()` rescaled by the global `nodal_correction`.
+        dI_drho, dI_dsource = _id_error_gradients(
+            state["entry"], rho_values, n_input_cells
+        )
         if want_rho:
-            dI_drho, _ = _gradient_pair(state["Ihat"], n_input_cells, fenics_to_input)
-            nodal_correction = state["nodal_correction"]
-            grad_rho[: hm.n_faces] += (
-                dI_drho * nodal_correction * cot_id_error
-            ).astype(np.float32)
-        # source: exact nodal-seeded adjoint (the scalar rescale is wrong here).
+            grad_rho[: hm.n_faces] += (dI_drho * cot_id_error).astype(np.float32)
         if want_source:
-            dI_dsource = _source_id_error_gradient(
-                state["entry"], rho_values, n_input_cells
-            )
             grad_source[: hm.n_faces] += (dI_dsource * cot_id_error).astype(np.float32)
 
     if want_rho:

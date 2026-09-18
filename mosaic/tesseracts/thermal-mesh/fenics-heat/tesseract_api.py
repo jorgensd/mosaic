@@ -237,8 +237,11 @@ def _setup_cache_key(
     p_exp: float,
     target_temperature: np.ndarray,
 ) -> str:
-    """Hash everything the Chat/Ihat graphs depend on — i.e. everything
-    except rho/source, which `Chat([rho, source])` replays the graph at."""
+    """Hash everything the Chat/Ihat graphs depend on.
+
+    That is everything except rho/source, which `Chat([rho, source])`
+    replays the graph at.
+    """
     h = hashlib.sha256()
     for arr in (
         pts,
@@ -265,9 +268,11 @@ def _build_reduced_functionals(
     p_exp: float,
     target_temperature: np.ndarray,
 ) -> dict[str, Any]:
-    """One-time setup for a (mesh, BC, material, target) combination: mesh,
-    function spaces, ONE annotated forward solve with rho/source as
-    controls, wrapped as two ReducedFunctionals sharing that tape.
+    """One-time setup for a (mesh, BC, material, target) combination.
+
+    Builds the mesh, function spaces, and ONE annotated forward solve with
+    rho/source as controls, wrapped as two ReducedFunctionals sharing that
+    tape.
 
     Solves the 3-D steady-state heat conduction topology optimisation problem:
         -∇·(k(ρ) ∇T) = 0    in Ω
@@ -375,19 +380,21 @@ def _build_reduced_functionals(
             target_at_dofs[dof_i] = float(T_tgt[vert_i])
     T_target_fn.vector()[:] = target_at_dofs
     diff = T_sol - T_target_fn
-    I = assemble(inner(diff, diff) * dx)
+    id_error_functional = assemble(inner(diff, diff) * dx)
 
     # Nodal correction: identification_error (forward) = sum(nodal diff^2),
     # while dolfin-adjoint differentiates ∫(T-T_t)² dΩ (area-weighted).
     coords = mesh.coordinates()
     domain_vol = float(
-        np.prod([coords[:, i].max() - coords[:, i].min() for i in range(coords.shape[1])])
+        np.prod(
+            [coords[:, i].max() - coords[:, i].min() for i in range(coords.shape[1])]
+        )
     )
     nodal_correction = float(mesh.num_vertices()) / domain_vol
 
     controls = [Control(rho_fn), Control(source_fn)]
     Chat = ReducedFunctional(J, controls)
-    Ihat = ReducedFunctional(I, [Control(rho_fn), Control(source_fn)])
+    Ihat = ReducedFunctional(id_error_functional, [Control(rho_fn), Control(source_fn)])
 
     return {
         "Chat": Chat,
@@ -411,8 +418,10 @@ def _get_reduced_functionals(
     p_exp: float,
     target_temperature: np.ndarray,
 ) -> dict[str, Any]:
-    """Build (or fetch) the cached Chat/Ihat pair for this (mesh, BC,
-    material, target_temperature) combination."""
+    """Build (or fetch) the cached Chat/Ihat pair for this combination.
+
+    Keyed on (mesh, BC, material, target_temperature).
+    """
     key = _setup_cache_key(
         pts,
         cells,
@@ -444,7 +453,9 @@ def _get_reduced_functionals(
     return entry
 
 
-def _gradient_pair(reduced_functional: Any, n_input_cells: int, fenics_to_input: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _gradient_pair(
+    reduced_functional: Any, n_input_cells: int, fenics_to_input: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     """(d/drho, d/dsource) from one adjoint sweep, mapped to input cell order."""
     d_rho_fn, d_source_fn = reduced_functional.derivative()
     d_rho = np.zeros(n_input_cells)
@@ -467,9 +478,10 @@ def _solve_forward(
     p_exp: float,
     target_temperature: np.ndarray,
 ) -> dict[str, Any]:
-    """Evaluate thermal_compliance at this (rho, source) by replaying the
-    cached `Chat` (which also refreshes `Ihat`'s shared tape state — see
-    module docstring above).
+    """Evaluate thermal_compliance at this (rho, source) by replaying `Chat`.
+
+    Replaying the cached `Chat` also refreshes `Ihat`'s shared tape state —
+    see module docstring above.
     """
     entry = _get_reduced_functionals(
         pts,
@@ -647,9 +659,13 @@ def vector_jacobian_product(
     n_input_cells = state["n_input_cells"]
     fenics_to_input = state["fenics_to_input"]
     result = {}
-    grad_rho = np.zeros(len(np.asarray(inputs.rho)), dtype=np.float32) if want_rho else None
+    grad_rho = (
+        np.zeros(len(np.asarray(inputs.rho)), dtype=np.float32) if want_rho else None
+    )
     grad_source = (
-        np.zeros(len(np.asarray(inputs.source)), dtype=np.float32) if want_source else None
+        np.zeros(len(np.asarray(inputs.source)), dtype=np.float32)
+        if want_source
+        else None
     )
 
     # One adjoint sweep per objective (not per control): each ReducedFunctional
@@ -657,15 +673,21 @@ def vector_jacobian_product(
     # gradients at once.
     cot_compliance = float(cotangent_vector.get("thermal_compliance", 0.0))
     if cot_compliance != 0.0:
-        dC_drho, dC_dsource = _gradient_pair(state["Chat"], n_input_cells, fenics_to_input)
+        dC_drho, dC_dsource = _gradient_pair(
+            state["Chat"], n_input_cells, fenics_to_input
+        )
         if want_rho:
             grad_rho[: hm.n_faces] += (dC_drho * cot_compliance).astype(np.float32)
         if want_source:
-            grad_source[: hm.n_faces] += (dC_dsource * cot_compliance).astype(np.float32)
+            grad_source[: hm.n_faces] += (dC_dsource * cot_compliance).astype(
+                np.float32
+            )
 
     cot_id_error = float(cotangent_vector.get("identification_error", 0.0))
     if cot_id_error != 0.0:
-        dI_drho, dI_dsource = _gradient_pair(state["Ihat"], n_input_cells, fenics_to_input)
+        dI_drho, dI_dsource = _gradient_pair(
+            state["Ihat"], n_input_cells, fenics_to_input
+        )
         nodal_correction = state["nodal_correction"]
         if want_rho:
             grad_rho[: hm.n_faces] += (

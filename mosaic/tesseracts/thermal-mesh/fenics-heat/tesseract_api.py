@@ -201,10 +201,16 @@ def _mark_neumann_facets(mesh: Mesh, neumann_mask_vals: np.ndarray) -> MeshFunct
 # functionals that can be replayed at any (rho, source), not a solve at one
 # point.
 #
-# Each `ReducedFunctional` carries *both* controls, so `.derivative()`
-# returns `[d/drho, d/dsource]` from a single adjoint sweep — the adjoint
+# Each `ReducedFunctional` carries both controls, so `.derivative()`
+# returns `[d/drho, d/dsource]` from a single adjoint sweep. The adjoint
 # method's cost is ~independent of the number of controls, so this is one
-# backward pass instead of two.
+# backward pass instead of two. The one exception is
+# d(identification_error)/d(source): the forward reports identification_error
+# as a nodal sum but `Ihat` differentiates the area-weighted `∫(T-T_t)² dΩ`,
+# and the per-node lumped mass that reconciles the two sits inside the
+# contraction over nodes, so no single scalar undoes it (it does,
+# approximately, for rho). That path uses an exact nodal-seeded adjoint
+# instead, in `_source_id_error_gradient`.
 #
 # `vector_jacobian_product` is self-contained: it replays
 # `Chat([rho, source])` at the point it was handed and then takes the
@@ -382,8 +388,10 @@ def _build_reduced_functionals(
     diff = T_sol - T_target_fn
     id_error_functional = assemble(inner(diff, diff) * dx)
 
-    # Nodal correction: identification_error (forward) = sum(nodal diff^2),
-    # while dolfin-adjoint differentiates ∫(T-T_t)² dΩ (area-weighted).
+    # `n_nodes / domain_vol` rescales the area-weighted `Ihat` gradient onto the
+    # forward's nodal-sum identification_error. Only an approximate lumped-mass
+    # rescale, but accurate enough for the rho gradient; the source gradient
+    # cannot use it and takes a separate path (`_source_id_error_gradient`).
     coords = mesh.coordinates()
     domain_vol = float(
         np.prod(
@@ -391,6 +399,14 @@ def _build_reduced_functionals(
         )
     )
     nodal_correction = float(mesh.num_vertices()) / domain_vol
+
+    # Homogeneous BCs for the nodal-seeded source adjoint solve (below): the
+    # same Dirichlet groups as the primal, but with a zero seed since prescribed
+    # nodes carry no identification-error sensitivity.
+    hom_dirichlet_bcs = [
+        DirichletBC(V, Constant(0.0), dirichlet_facet_markers, k + 1)
+        for k in range(dirichlet_values_vals.shape[0])
+    ]
 
     controls = [Control(rho_fn), Control(source_fn)]
     Chat = ReducedFunctional(J, controls)
@@ -400,9 +416,14 @@ def _build_reduced_functionals(
         "Chat": Chat,
         "Ihat": Ihat,
         "rho_space": DG0,
+        "V": V,
+        "a": a,
+        "rho_fn": rho_fn,
+        "T_sol": T_sol,
+        "T_target_fn": T_target_fn,
+        "hom_dirichlet_bcs": hom_dirichlet_bcs,
         "fenics_to_input": fenics_to_input,
         "mesh": mesh,
-        "T_sol": T_sol,
         "nodal_correction": nodal_correction,
     }
 
@@ -465,6 +486,57 @@ def _gradient_pair(
     return d_rho, d_source
 
 
+def _source_id_error_gradient(
+    entry: dict[str, Any], rho_values: np.ndarray, n_input_cells: int
+) -> np.ndarray:
+    """Exact ∂(identification_error)/∂source, mapped to input cell order.
+
+    `Ihat.derivative()` cannot supply this (see the module docstring for why the
+    global `nodal_correction` scalar works for rho but not source). Instead seed
+    the adjoint directly with the nodal residual:
+        A λ = 2(T - T_target),   homogeneous Dirichlet
+        dI/dsource_e = ∫_Ω_e λ dΩ   (source enters the residual as source·v·dx)
+    This is exact for the nodal functional and independent of the mass lumping.
+
+    ``T`` is read back through the block variable that `Chat([rho, source])`
+    just refreshed, since the replay stores the solution on the block rather
+    than on `T_sol` in place.
+    """
+    V = entry["V"]
+    DG0 = entry["rho_space"]
+    a = entry["a"]
+    rho_fn = entry["rho_fn"]
+    T_target_fn = entry["T_target_fn"]
+    fenics_to_input = entry["fenics_to_input"]
+
+    T_current = entry["T_sol"].block_variable.saved_output
+
+    # Pin the form's conductivity to the current rho (same clip/reorder as the
+    # forward) so the assembled operator matches the forward solve exactly.
+    with stop_annotating():
+        rho_fn.vector()[:] = np.clip(rho_values[fenics_to_input], 0.0, 1.0)
+
+    A_adj = assemble(a)
+    adjoint_rhs = Function(V)
+    adjoint_rhs.vector()[:] = 2.0 * (
+        T_current.vector().get_local() - T_target_fn.vector().get_local()
+    )
+    for bc_adj in entry["hom_dirichlet_bcs"]:
+        bc_adj.apply(A_adj, adjoint_rhs.vector())
+
+    lam = Function(V)
+    # Plain backend linear algebra: the hand-rolled adjoint must not be recorded
+    # on the tape (the overridden solve/LUSolver expect a variational form and
+    # would try `b.form` on the assembled vector).
+    with stop_annotating():
+        LUSolver(A_adj).solve(lam.vector(), adjoint_rhs.vector())
+    dI_src_fenics = assemble(lam * TestFunction(DG0) * dx).get_local()
+
+    dI_source = np.zeros(n_input_cells)
+    dI_source[fenics_to_input] = dI_src_fenics
+    return dI_source
+
+
 def _solve_forward(
     rho_values: np.ndarray,
     source_values: np.ndarray,
@@ -518,6 +590,7 @@ def _solve_forward(
     T_vertices = T_current.compute_vertex_values(entry["mesh"])
 
     return {
+        "entry": entry,
         "Chat": entry["Chat"],
         "Ihat": entry["Ihat"],
         "J": J,
@@ -599,16 +672,16 @@ def vector_jacobian_product(
     replays the forward problem at the (rho, source) it is given and then
     computes the adjoint(s), rather than reusing a solution cached by a
     preceding ``apply`` call — see the module docstring above for why. The
-    replay reuses the cached mesh/function spaces and the compiled UFL
-    forms, so no mesh rebuild or form reconstruction happens. Each
-    functional carries both controls, so one ``.derivative()`` call yields
-    both ``d/drho`` and ``d/dsource`` from a single adjoint sweep.
+    replay reuses the cached mesh/function spaces and the compiled UFL forms,
+    so no mesh rebuild or form reconstruction happens. Each functional carries
+    both controls, so a single ``.derivative()`` sweep yields both ``d/drho``
+    and ``d/dsource``, except source → identification_error (see below).
 
     Supports:
-        rho    → thermal_compliance  (SIMP adjoint via dolfin-adjoint)
-        rho    → identification_error (SIMP adjoint on ||T-T_target||² functional)
-        source → thermal_compliance
-        source → identification_error (nodal L2 adjoint with area correction)
+        rho    → thermal_compliance   (SIMP adjoint via dolfin-adjoint)
+        rho    → identification_error (Ihat.derivative() × nodal_correction)
+        source → thermal_compliance   (Chat.derivative())
+        source → identification_error (exact nodal-seeded adjoint, not rescaled)
 
     Args:
         inputs: Validated InputSchema.
@@ -668,9 +741,9 @@ def vector_jacobian_product(
         else None
     )
 
-    # One adjoint sweep per objective (not per control): each ReducedFunctional
-    # carries both [rho, source] controls, so `.derivative()` yields both
-    # gradients at once.
+    # Compliance: one adjoint sweep serves both controls — the ReducedFunctional
+    # carries [rho, source], so `.derivative()` yields d/drho and d/dsource at
+    # once. (Identification error handles its source gradient separately below.)
     cot_compliance = float(cotangent_vector.get("thermal_compliance", 0.0))
     if cot_compliance != 0.0:
         dC_drho, dC_dsource = _gradient_pair(
@@ -685,18 +758,19 @@ def vector_jacobian_product(
 
     cot_id_error = float(cotangent_vector.get("identification_error", 0.0))
     if cot_id_error != 0.0:
-        dI_drho, dI_dsource = _gradient_pair(
-            state["Ihat"], n_input_cells, fenics_to_input
-        )
-        nodal_correction = state["nodal_correction"]
+        # rho: `Ihat.derivative()` rescaled by the global `nodal_correction`.
         if want_rho:
+            dI_drho, _ = _gradient_pair(state["Ihat"], n_input_cells, fenics_to_input)
+            nodal_correction = state["nodal_correction"]
             grad_rho[: hm.n_faces] += (
                 dI_drho * nodal_correction * cot_id_error
             ).astype(np.float32)
+        # source: exact nodal-seeded adjoint (the scalar rescale is wrong here).
         if want_source:
-            grad_source[: hm.n_faces] += (
-                dI_dsource * nodal_correction * cot_id_error
-            ).astype(np.float32)
+            dI_dsource = _source_id_error_gradient(
+                state["entry"], rho_values, n_input_cells
+            )
+            grad_source[: hm.n_faces] += (dI_dsource * cot_id_error).astype(np.float32)
 
     if want_rho:
         result["rho"] = grad_rho

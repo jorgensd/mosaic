@@ -192,7 +192,7 @@ def _mark_neumann_facets(mesh: Mesh, neumann_mask_vals: np.ndarray) -> MeshFunct
 # spaces, facet marking, UFL form assembly and `solve()`. Every later
 # evaluation at a different rho,  the entire point of a topology-optimisation,
 # run calls `Jhat(new_rho)` instead.
-# dolfin-adjoint updates the control's checkpoint and replays each 
+# dolfin-adjoint updates the control's checkpoint and replays each
 # already-recorded Block's `recompute()` in place.
 # `vector_jacobian_product` is self-contained: it replays `Jhat(rho)` at the
 # point it was handed and then takes `Jhat.derivative()` (dolfin-adjoint's
@@ -221,8 +221,10 @@ def _setup_cache_key(
     xmin: float,
     penal: float,
 ) -> str:
-    """Hash everything the ReducedFunctional's graph depends on — i.e.
-    everything except rho, which `Jhat(rho)` replays the graph at."""
+    """Hash everything the ReducedFunctional's graph depends on.
+
+    That is everything except rho, which `Jhat(rho)` replays the graph at.
+    """
     h = hashlib.sha256()
     for arr in (
         pts,
@@ -249,8 +251,10 @@ def _build_reduced_functional(
     xmin: float,
     penal: float,
 ) -> dict[str, Any]:
-    """One-time setup for a (mesh, BC, material) combination: mesh, function
-    spaces, ONE annotated forward solve, wrapped as a `ReducedFunctional`.
+    """One-time setup for a (mesh, BC, material) combination.
+
+    Builds the mesh, function spaces, and ONE annotated forward solve,
+    wrapped as a `ReducedFunctional`.
 
     Solves 3-D linear elasticity topology optimisation problem:
         -div(sigma(u)) = 0    in Omega
@@ -359,8 +363,10 @@ def _get_reduced_functional(
     xmin: float,
     penal: float,
 ) -> dict[str, Any]:
-    """Build (or fetch) the cached `ReducedFunctional` for this (mesh, BC,
-    material) combination."""
+    """Build (or fetch) the cached `ReducedFunctional` for this combination.
+
+    Keyed on (mesh, BC, material).
+    """
     key = _setup_cache_key(
         pts,
         cells,

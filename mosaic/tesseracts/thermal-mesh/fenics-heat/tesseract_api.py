@@ -47,8 +47,14 @@ from mosaic_shared.problems.thermal_mesh import (
     OutputSchema as _CanonicalOutputSchema,
 )
 from mosaic_shared.schema_types import make_differentiable
-from pyadjoint import Block, create_overloaded_object
-from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
+
+try:
+    from pyadjoint import Block, create_overloaded_object
+    from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
+except ImportError:
+    from pyadjoint.overloaded_type import create_overloaded_object
+    from pyadjoint.block import Block
+    from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
 from pydantic import Field
 from scipy.spatial import cKDTree
 from tesseract_core.runtime import ShapeDType

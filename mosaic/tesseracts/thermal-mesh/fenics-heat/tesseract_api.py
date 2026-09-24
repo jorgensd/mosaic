@@ -47,6 +47,14 @@ from mosaic_shared.problems.thermal_mesh import (
     OutputSchema as _CanonicalOutputSchema,
 )
 from mosaic_shared.schema_types import make_differentiable
+
+try:
+    from pyadjoint import Block, create_overloaded_object
+    from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
+except ImportError:
+    from pyadjoint.overloaded_type import create_overloaded_object
+    from pyadjoint.block import Block
+    from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
 from pydantic import Field
 from scipy.spatial import cKDTree
 from tesseract_core.runtime import ShapeDType
@@ -177,6 +185,111 @@ def _mark_neumann_facets(mesh: Mesh, neumann_mask_vals: np.ndarray) -> MeshFunct
 
 
 # ---------------------------------------------------------------------------
+# Identification error as a tape-recorded operation
+# ---------------------------------------------------------------------------
+#
+# Hex grids in legacy FEniCS does not support vertex quadrature, so
+# the nodal sum Σ_v (T_v − T_target,v)² cannot be expressed as an integral
+# that is divided by the lumped mass matrix. This works in DOLFINx.
+# Instead we use the Pyadjoint blocking system to add the NodalSquaredError
+# to the computational tape.
+#
+# A `Block` puts the reduction back on the tape. pyadjoint then owns the whole
+# chain, so `Ihat.derivative()` gives d/drho and d/dsource with no hand-written
+# adjoint: the recorded `SolveVarFormBlock` performs the adjoint solve (with
+# the forward's homogenised BCs and its recorded `solver_parameters`, i.e.
+# mumps via the fix at the top of this file) and UFL differentiates k(ρ)
+# itself. The value and the gradient then come from one definition of the
+# functional rather than two that have to be kept in step by hand.
+
+
+def _nodal_residual(T: Function, target: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Masked residual mask · (T − target), in dof order."""
+    if MPI.comm_world.size > 1:
+        raise RuntimeError(
+            "Nodal residual is not implemented for MPI parallel runs; "
+            "run with a single process (mpirun -n 1) instead."
+        )
+    return mask * (T.vector().get_local() - target)
+
+
+class NodalSquaredErrorBlock(Block):
+    """Tape block for I(T) = Σ_v mask_v (T_v − target_v)², T in a CG1 space.
+
+    `target` and `mask` are constants of the problem, not controls, so `T` is
+    the block's only dependency. `mask` is 0 at nodes the caller gave no
+    target value for, dropping them from the value and the adjoint seed alike.
+    """
+
+    def __init__(self, T: Function, target: np.ndarray, mask: np.ndarray):
+        """Record `T` as the block's single dependency; target/mask are fixed."""
+        super().__init__()
+        self.add_dependency(T)
+        self._target = target
+        self._mask = mask
+
+    def __str__(self) -> str:
+        """Label used in tape visualisations."""
+        return "NodalSquaredError"
+
+    def recompute_component(
+        self, inputs: list, block_variable: Any, idx: int, prepared: Any = None
+    ) -> Any:
+        """Re-evaluate the nodal sum during a tape replay."""
+        r = _nodal_residual(inputs[0], self._target, self._mask)
+        return create_overloaded_object(float(np.dot(r, r)))
+
+    def evaluate_adj_component(
+        self,
+        inputs: list,
+        adj_inputs: list,
+        block_variable: Any,
+        idx: int,
+        prepared: Any = None,
+    ) -> Any:
+        """Adjoint seed dI/dT, handed on to the recorded solve block."""
+        # dI/dT is the bare nodal residual — no mass matrix, matching the
+        # nodal functional. Returned as a dual vector, as the other blocks'
+        # `Function` adjoint components are.
+        seed = inputs[0].vector().copy()
+        seed.set_local(
+            2.0
+            * float(adj_inputs[0])
+            * _nodal_residual(inputs[0], self._target, self._mask)
+        )
+        seed.apply("insert")
+        return seed
+
+    def evaluate_tlm_component(
+        self,
+        inputs: list,
+        tlm_inputs: list,
+        block_variable: Any,
+        idx: int,
+        prepared: Any = None,
+    ) -> Any:
+        """Directional derivative dI/dT · T_dot, for `taylor_test`."""
+        T_dot = tlm_inputs[0]
+        if T_dot is None:
+            return None
+        r = _nodal_residual(inputs[0], self._target, self._mask)
+        return 2.0 * float(np.dot(r, T_dot.vector().get_local()))
+
+
+def nodal_squared_error(T: Function, target: np.ndarray, mask: np.ndarray) -> Any:
+    """Σ_v mask_v (T_v − target_v)², recorded on the tape as an AdjFloat."""
+    annotate = annotate_tape()
+    with stop_annotating():
+        r = _nodal_residual(T, target, mask)
+    output = create_overloaded_object(float(np.dot(r, r)))
+    if annotate:
+        block = NodalSquaredErrorBlock(T, target, mask)
+        get_working_tape().add_block(block)
+        block.add_output(output.block_variable)
+    return output
+
+
+# ---------------------------------------------------------------------------
 # Core solver
 # ---------------------------------------------------------------------------
 #
@@ -200,9 +313,11 @@ def _mark_neumann_facets(mesh: Mesh, neumann_mask_vals: np.ndarray) -> MeshFunct
 # `Chat` carries both controls, so `.derivative()` returns
 # `[d/drho, d/dsource]` from a single adjoint sweep. The adjoint method's
 # cost is ~independent of the number of controls, so this is one backward
-# pass instead of two. identification_error is reported as a nodal sum
-# rather than an integral, so both of its gradients come from one adjoint
-# seeded with the nodal residual instead, in `_id_error_gradients`.
+# pass instead of two. `Ihat` is a second ReducedFunctional over the same
+# tape and the same controls, for identification_error, and gives that
+# functional's two gradients from its own single sweep; see
+# `NodalSquaredErrorBlock` above for how a nodal (non-integral) functional
+# gets onto the tape at all.
 #
 # `vector_jacobian_product` is self-contained: it replays
 # `Chat([rho, source])` at the point it was handed and then takes the
@@ -285,13 +400,13 @@ def _build_reduced_functionals(
     Thermal compliance objective:
         C = ∮_Γ_N q_n · T dΓ
 
-    Identification-error objective, computed in `apply`:
+    Identification-error objective:
         I = Σ_nodes (T - T_target)²
 
     Returns:
-        ``{"Chat", "rho_space", "fenics_to_input", "mesh", "T_sol"}``; see the
-        module docstring above for how these get reused at every later
-        (rho, source).
+        ``{"Chat", "Ihat", "I_err", "rho_space", "fenics_to_input", "mesh",
+        "T_sol"}``; see the module docstring above for how these get reused at
+        every later (rho, source).
     """
     mesh = _build_fenics_mesh(pts, cells)
     fenics_to_input = _cell_reorder_map(pts, cells, mesh)
@@ -365,36 +480,29 @@ def _build_reduced_functionals(
     J = assemble(J_form)
 
     # ---- Objective: identification error -----------------------------------
-    T_target_fn = Function(V)
+    # I = Σ_v mask_v (T_v − T_target,v), recorded on the tape by
+    # NodalSquaredErrorBlock. mask is 0 at nodes the caller supplied no target
+    # for, so the value and the adjoint seed cover the same node set by
+    # construction.
     d2v = dof_to_vertex_map(V)
     T_tgt = np.asarray(target_temperature, dtype=np.float64)
+    has_target = d2v < len(T_tgt)
     target_at_dofs = np.zeros(V.dim(), dtype=np.float64)
-    for dof_i in range(V.dim()):
-        vert_i = int(d2v[dof_i])
-        if vert_i < len(T_tgt):
-            target_at_dofs[dof_i] = float(T_tgt[vert_i])
-    T_target_fn.vector()[:] = target_at_dofs
+    target_at_dofs[has_target] = T_tgt[d2v[has_target]]
+    mask_at_dofs = has_target.astype(np.float64)
 
-    # Homogeneous BCs for the nodal-seeded adjoint solve (below): the
-    # same Dirichlet groups as the primal, but with a zero seed since prescribed
-    # nodes carry no identification-error sensitivity.
-    hom_dirichlet_bcs = [
-        DirichletBC(V, Constant(0.0), dirichlet_facet_markers, k + 1)
-        for k in range(dirichlet_values_vals.shape[0])
-    ]
+    I_err = nodal_squared_error(T_sol, target_at_dofs, mask_at_dofs)
 
     controls = [Control(rho_fn), Control(source_fn)]
     Chat = ReducedFunctional(J, controls)
+    Ihat = ReducedFunctional(I_err, controls)
 
     return {
         "Chat": Chat,
+        "Ihat": Ihat,
+        "I_err": I_err,
         "rho_space": DG0,
-        "V": V,
-        "a": a,
-        "rho_fn": rho_fn,
         "T_sol": T_sol,
-        "T_target_fn": T_target_fn,
-        "hom_dirichlet_bcs": hom_dirichlet_bcs,
         "fenics_to_input": fenics_to_input,
         "mesh": mesh,
     }
@@ -458,62 +566,6 @@ def _gradient_pair(
     return d_rho, d_source
 
 
-def _id_error_gradients(
-    entry: dict[str, Any], rho_values: np.ndarray, n_input_cells: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Exact ∂(identification_error)/∂(rho, source), mapped to input cell order.
-
-    The forward reports identification_error as a nodal sum, so the adjoint is
-    seeded directly with the nodal residual:
-        A λ = 2(T - T_target),   homogeneous Dirichlet
-        dI/drho_e    = -∫_Ω_e k'(ρ) ∇T·∇λ dΩ   (rho enters through k(ρ) in a)
-        dI/dsource_e = ∫_Ω_e λ dΩ   (source enters the residual as source·v·dx)
-    This is exact for the nodal functional and independent of the mass lumping.
-
-    ``T`` is read back through the block variable that `Chat([rho, source])`
-    just refreshed, since the replay stores the solution on the block rather
-    than on `T_sol` in place.
-    """
-    V = entry["V"]
-    DG0 = entry["rho_space"]
-    a = entry["a"]
-    rho_fn = entry["rho_fn"]
-    T_target_fn = entry["T_target_fn"]
-    fenics_to_input = entry["fenics_to_input"]
-
-    T_current = entry["T_sol"].block_variable.saved_output
-
-    # Pin the form's conductivity to the current rho (same clip/reorder as the
-    # forward) so the assembled operator matches the forward solve exactly.
-    with stop_annotating():
-        rho_fn.vector()[:] = np.clip(rho_values[fenics_to_input], 0.0, 1.0)
-
-    A_adj = assemble(a)
-    adjoint_rhs = Function(V)
-    adjoint_rhs.vector()[:] = 2.0 * (
-        T_current.vector().get_local() - T_target_fn.vector().get_local()
-    )
-    for bc_adj in entry["hom_dirichlet_bcs"]:
-        bc_adj.apply(A_adj, adjoint_rhs.vector())
-
-    lam = Function(V)
-    # Plain backend linear algebra: the hand-rolled adjoint must not be recorded
-    # on the tape (the overridden solve/LUSolver expect a variational form and
-    # would try `b.form` on the assembled vector).
-    with stop_annotating():
-        LUSolver(A_adj).solve(lam.vector(), adjoint_rhs.vector())
-    dI_rho_fenics = assemble(
-        -derivative(action(action(a, T_current), lam), rho_fn)
-    ).get_local()
-    dI_src_fenics = assemble(lam * TestFunction(DG0) * dx).get_local()
-
-    dI_rho = np.zeros(n_input_cells)
-    dI_rho[fenics_to_input] = dI_rho_fenics
-    dI_source = np.zeros(n_input_cells)
-    dI_source[fenics_to_input] = dI_src_fenics
-    return dI_rho, dI_source
-
-
 def _solve_forward(
     rho_values: np.ndarray,
     source_values: np.ndarray,
@@ -527,7 +579,7 @@ def _solve_forward(
     p_exp: float,
     target_temperature: np.ndarray,
 ) -> dict[str, Any]:
-    """Evaluate thermal_compliance at this (rho, source) by replaying `Chat`."""
+    """Evaluate both objectives at this (rho, source) by replaying the tape."""
     entry = _get_reduced_functionals(
         pts,
         cells,
@@ -554,19 +606,22 @@ def _solve_forward(
     source_fn.vector()[:] = src_reordered
 
     J = entry["Chat"]([rho_fn, source_fn])
-    # `entry["T_sol"]` is the Python object from the ONE-TIME setup solve;
-    # dolfin-adjoint's replay creates a fresh Function each time (see
-    # `GenericSolveBlock._create_initial_guess`) and stores the result on the
-    # ORIGINAL block_variable's checkpoint rather than mutating that first
-    # object in place, so the current value must be read back through it.
-    T_current = entry["T_sol"].block_variable.saved_output
-    T_vertices = T_current.compute_vertex_values(entry["mesh"])
+    # `ReducedFunctional.__call__` replays EVERY block on the tape, not only
+    # those the functional depends on, so the identification-error block has
+    # been recomputed by that same call and both objectives come out of one
+    # solve. Its value is read off the block variable rather than by calling
+    # `Ihat([rho, source])`, which would replay — and re-solve — a second time.
+    # (dolfin-adjoint's replay creates a fresh Function each time, see
+    # `GenericSolveBlock._create_initial_guess`, and stores results on the
+    # ORIGINAL block variables' checkpoints rather than mutating the setup
+    # objects in place, so values must be read back through them.)
+    I_err = float(entry["I_err"].block_variable.saved_output)
 
     return {
-        "entry": entry,
         "Chat": entry["Chat"],
+        "Ihat": entry["Ihat"],
         "J": J,
-        "T_vertices": T_vertices,
+        "I_err": I_err,
         "fenics_to_input": fenics_to_input,
         "n_input_cells": len(rho_values),
     }
@@ -578,22 +633,21 @@ def _solve_forward(
 
 
 def apply(inputs: InputSchema) -> OutputSchema:
-    """Forward pass: solve heat conduction and return compliance + temperature.
+    """Forward pass: solve heat conduction and return both objectives.
 
     Args:
         inputs: Validated InputSchema containing the density field, mesh,
                 boundary conditions, and material parameters.
 
     Returns:
-        OutputSchema with thermal_compliance (scalar), temperature (n_vertices,),
-        and identification_error (scalar).
+        OutputSchema with thermal_compliance and identification_error, both
+        scalars, from a single replay of the tape.
     """
     hm = inputs.hex_mesh
     pts = np.asarray(hm.points[: hm.n_points], dtype=np.float64)
     cells = np.asarray(hm.faces[: hm.n_faces], dtype=np.int64)
     rho_values = np.asarray(inputs.rho[: hm.n_faces], dtype=np.float64)
     source_values = np.asarray(inputs.source[: hm.n_faces], dtype=np.float64)
-    target_temp = np.asarray(inputs.target_temperature, dtype=np.float32)
     bc = inputs.boundary_conditions
     dm = np.asarray(bc.dirichlet.mask if bc.dirichlet else [])
     dv = np.asarray(
@@ -621,13 +675,9 @@ def apply(inputs: InputSchema) -> OutputSchema:
         np.asarray(inputs.target_temperature, dtype=np.float64),
     )
 
-    T_f32 = state["T_vertices"].astype(np.float32)
-    n = min(len(T_f32), len(target_temp))
-    id_error = np.float32(np.sum((T_f32[:n] - target_temp[:n]) ** 2))
-
     return OutputSchema(
         thermal_compliance=np.float32(float(state["J"])),
-        identification_error=id_error,
+        identification_error=np.float32(state["I_err"]),
     )
 
 
@@ -646,13 +696,14 @@ def vector_jacobian_product(
     replay reuses the cached mesh/function spaces and the compiled UFL forms,
     so no mesh rebuild or form reconstruction happens. ``Chat`` carries both
     controls, so a single ``.derivative()`` sweep yields both ``d/drho`` and
-    ``d/dsource``; identification_error gets both from one nodal-seeded adjoint.
+    ``d/dsource``; ``Ihat`` carries the same two controls, so
+    identification_error's pair comes from a second single sweep.
 
     Supports:
-        rho    → thermal_compliance   (SIMP adjoint via dolfin-adjoint)
-        rho    → identification_error (exact nodal-seeded adjoint)
+        rho    → thermal_compliance   (Chat.derivative())
+        rho    → identification_error (Ihat.derivative())
         source → thermal_compliance   (Chat.derivative())
-        source → identification_error (exact nodal-seeded adjoint)
+        source → identification_error (Ihat.derivative())
 
     Args:
         inputs: Validated InputSchema.
@@ -714,7 +765,9 @@ def vector_jacobian_product(
 
     # Compliance: one adjoint sweep serves both controls — the ReducedFunctional
     # carries [rho, source], so `.derivative()` yields d/drho and d/dsource at
-    # once. (Identification error handles both gradients separately below.)
+    # once. (Identification error takes its own sweep over the same tape
+    # below; each `.derivative()` calls `Tape.reset_variables()` first, so the
+    # two do not contaminate one another.)
     cot_compliance = float(cotangent_vector.get("thermal_compliance", 0.0))
     if cot_compliance != 0.0:
         dC_drho, dC_dsource = _gradient_pair(
@@ -729,8 +782,8 @@ def vector_jacobian_product(
 
     cot_id_error = float(cotangent_vector.get("identification_error", 0.0))
     if cot_id_error != 0.0:
-        dI_drho, dI_dsource = _id_error_gradients(
-            state["entry"], rho_values, n_input_cells
+        dI_drho, dI_dsource = _gradient_pair(
+            state["Ihat"], n_input_cells, fenics_to_input
         )
         if want_rho:
             grad_rho[: hm.n_faces] += (dI_drho * cot_id_error).astype(np.float32)

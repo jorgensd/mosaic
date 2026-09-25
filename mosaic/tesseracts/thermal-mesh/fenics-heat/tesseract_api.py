@@ -52,8 +52,8 @@ try:
     from pyadjoint import Block, create_overloaded_object
     from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
 except ImportError:
-    from pyadjoint.overloaded_type import create_overloaded_object
     from pyadjoint.block import Block
+    from pyadjoint.overloaded_type import create_overloaded_object
     from pyadjoint.tape import annotate_tape, get_working_tape, stop_annotating
 from pydantic import Field
 from scipy.spatial import cKDTree
@@ -221,7 +221,7 @@ class NodalSquaredErrorBlock(Block):
     target value for, dropping them from the value and the adjoint seed alike.
     """
 
-    def __init__(self, T: Function, target: np.ndarray, mask: np.ndarray):
+    def __init__(self, T: Function, target: np.ndarray, mask: np.ndarray) -> None:
         """Record `T` as the block's single dependency; target/mask are fixed."""
         super().__init__()
         self.add_dependency(T)
